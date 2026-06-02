@@ -1,0 +1,16 @@
+CREATE TABLE IF NOT EXISTS access_tokens (
+    iss TEXT NOT NULL,
+    sub UUID NOT NULL,
+    iat TIMESTAMPTZ NOT NULL,
+    exp TIMESTAMPTZ NOT NULL,
+    jti UUID NOT NULL
+);
+
+CREATE TABLE if NOT EXISTS refresh_tokens (
+    iss TEXT NOT NULL,
+    sub UUID NOT NULL,
+    token_hash TEXT NOT NULL,
+    iat TIMESTAMPTZ NOT NULL,
+    exp TIMESTAMPTZ NOT NULL,
+    jti UUID NOT NULL
+);

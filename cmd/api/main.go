@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,15 +34,38 @@ type createTokenRequest struct {
 }
 
 type accessTokenInput struct {
-	Sub string
-	Aud string
+	Sub       string
+	Aud       string
+	FirstName string
+	LastName  string
+	Email     string
+}
+
+type accessTokenClaims struct {
+	jwt.RegisteredClaims
+}
+
+type idTokenClaims struct {
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
+	Email     string `json:"email"`
+	jwt.RegisteredClaims
+}
+
+type authenticatedUser struct {
+	ID           string
+	FirstName    string
+	LastName     string
+	Email        string
+	PasswordHash string
 }
 
 type createTokenResponse struct {
-	AccessToken string `json:"access_token"`
-	IDToken	string `json:"id_token"`
+	AccessToken  string `json:"access_token"`
+	IDToken      string `json:"id_token"`
 	RefreshToken string `json:"refresh_token"`
-	ExpiresAt   string `json:"expires_at"`
+	TokenType    string `json:"token_type"`
+	ExpiresIn    int    `json:"expires_in"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
@@ -49,38 +74,87 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-func authenticateUser(ctx context.Context, db *sql.DB, username, password string) (string, error) {
+func authenticateUser(ctx context.Context, db *sql.DB, username, password string) (authenticatedUser, error) {
 	username = strings.TrimSpace(username)
 	if username == "" || password == "" {
-		return "", errors.New("username and password are required")
+		return authenticatedUser{}, errors.New("username and password are required")
 	}
 
-	var userID string
-	var passwordHash string
+	var user authenticatedUser
 
-	err := db.QueryRowContext(ctx, "SELECT id::text, password_hash FROM users WHERE username = $1", username).Scan(&userID, &passwordHash)
+	err := db.QueryRowContext(
+		ctx,
+		"SELECT id::text, first_name, last_name, email, password_hash FROM users WHERE username = $1",
+		username,
+	).Scan(&user.ID, &user.FirstName, &user.LastName, &user.Email, &user.PasswordHash)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", errors.New("invalid credentials")
+			return authenticatedUser{}, errors.New("invalid credentials")
 		}
-		return "", err
+		return authenticatedUser{}, err
 	}
 
 	computedHash := fmt.Sprintf("%x", sha256.Sum256([]byte(password)))
-	if subtle.ConstantTimeCompare([]byte(computedHash), []byte(strings.ToLower(passwordHash))) != 1 {
-		return "", errors.New("invalid credentials")
+	if subtle.ConstantTimeCompare([]byte(computedHash), []byte(strings.ToLower(user.PasswordHash))) != 1 {
+		return authenticatedUser{}, errors.New("invalid credentials")
 	}
 
-	return userID, nil
+	return user, nil
 }
 
-func createAccessToken(secret string, req accessTokenInput) (createTokenResponse, error) {
+func createAccessToken(secret string, req accessTokenInput) (string, error) {
+	if req.Aud == "" {
+		req.Aud = "api.local"
+	}
+
+	now := time.Now().UTC()
+
+	claims := accessTokenClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "auth.local",
+			Subject:   req.Sub,
+			Audience:  jwt.ClaimStrings{req.Aud},
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(15 * time.Minute)),
+			ID:        uuid.NewString(),
+		},
+	}
+
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
 }
 
 func createIDToken(secret string, req accessTokenInput) (string, error) {
+	if req.Aud == "" {
+		req.Aud = "api.local"
+	}
+
+	now := time.Now().UTC()
+
+	claims := idTokenClaims{
+		FirstName: req.FirstName,
+		LastName:  req.LastName,
+		Email:     req.Email,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "auth.local",
+			Subject:   req.Sub,
+			Audience:  jwt.ClaimStrings{req.Aud},
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(15 * time.Minute)),
+			ID:        uuid.NewString(),
+		},
+	}
+
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
 }
 
-func createRefreshToken(secret string, req accessTokenInput) (string, error) {
+func createRefreshToken() (string, error) {
+	randomBytes := make([]byte, 48)
+	_, err := rand.Read(randomBytes)
+	if err != nil {
+		return "", err
+	}
+
+	return base64.RawURLEncoding.EncodeToString(randomBytes), nil
 }
 
 func createTokens(secret string, req accessTokenInput) (createTokenResponse, error) {
@@ -88,33 +162,27 @@ func createTokens(secret string, req accessTokenInput) (createTokenResponse, err
 		return createTokenResponse{}, errors.New("sub is required")
 	}
 
-	if req.Aud == "" {
-		req.Aud = "api.local"
+	accessToken, err := createAccessToken(secret, req)
+	if err != nil {
+		return createTokenResponse{}, err
 	}
 
-	now := time.Now().UTC()
-	expiresAt := now.Add(15 * time.Minute)
-
-	claims := jwt.RegisteredClaims{
-		Issuer:    "auth.local",
-		Subject:   req.Sub,
-		Audience:  jwt.ClaimStrings{req.Aud},
-		IssuedAt:  jwt.NewNumericDate(now),
-		ExpiresAt: jwt.NewNumericDate(expiresAt),
-		ID:        uuid.NewString(),
+	idToken, err := createIDToken(secret, req)
+	if err != nil {
+		return createTokenResponse{}, err
 	}
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	signed_access_token, err := token.SignedString([]byte(secret))
+	refreshToken, err := createRefreshToken()
 	if err != nil {
 		return createTokenResponse{}, err
 	}
 
 	return createTokenResponse{
-		AccessToken: signed_access_token,
-		IDToken:     id_token,
-		RefreshToken: refresh_token,
-		ExpiresAt:   expiresAt.Format(time.RFC3339),
+		AccessToken:  accessToken,
+		IDToken:      idToken,
+		RefreshToken: refreshToken,
+		TokenType:    "Bearer",
+		ExpiresIn:    900,
 	}, nil
 }
 
@@ -167,7 +235,7 @@ func main() {
 			return
 		}
 
-		sub, err := authenticateUser(r.Context(), db, req.Username, req.Password)
+		user, err := authenticateUser(r.Context(), db, req.Username, req.Password)
 		if err != nil {
 			if err.Error() == "invalid credentials" {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
@@ -184,9 +252,15 @@ func main() {
 			return
 		}
 
-		resp, err := createAccessToken(jwtSecret, accessTokenInput{Sub: sub, Aud: req.Aud})
+		resp, err := createTokens(jwtSecret, accessTokenInput{
+			Sub:       user.ID,
+			Aud:       req.Aud,
+			FirstName: user.FirstName,
+			LastName:  user.LastName,
+			Email:     user.Email,
+		})
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create tokens"})
 			return
 		}
 

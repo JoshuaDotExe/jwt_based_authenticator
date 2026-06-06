@@ -4,6 +4,7 @@ WORKDIR /app
 COPY go.mod ./
 COPY go.sum ./
 COPY cmd ./cmd
+COPY internal ./internal
 
 RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/api ./cmd/api
 

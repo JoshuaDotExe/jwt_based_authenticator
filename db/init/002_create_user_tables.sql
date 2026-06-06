@@ -4,18 +4,31 @@ CREATE TABLE IF NOT EXISTS users (
     last_name TEXT NOT NULL,
     email TEXT NOT NULL UNIQUE,
     username TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-INSERT INTO users (id, first_name, last_name, email, username, password_hash)
+CREATE TABLE IF NOT EXISTS user_credentials (
+    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    password_hash TEXT NOT NULL,
+    password_algo TEXT NOT NULL,
+    password_changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO users (id, first_name, last_name, email, username)
 VALUES (
     '11111111-2222-3333-4444-555555555555',
     'Test',
     'User',
     'testuser@example.com',
-    'testuser',
-    '9f735e0df9a1ddc702bf0a1a7b83033f9f7153a00c29de82cedadc9957289b05'
+    'testuser'
 )
 ON CONFLICT (username) DO NOTHING;
+
+INSERT INTO user_credentials (user_id, password_hash, password_algo)
+VALUES (
+    '11111111-2222-3333-4444-555555555555',
+    '$argon2id$v=19$m=65536,t=3,p=2$and0c2VlZHN0YXRpY3NhbHQ$tJ1IZjpbKmSb1z+LnhKeo7I6bQXXht+r5czuAZCg3y0',
+    'argon2id'
+)
+ON CONFLICT (user_id) DO NOTHING;

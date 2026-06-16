@@ -347,6 +347,7 @@ func main() {
 	protected := router.Group("")
 	protected.Use(authMiddleware(jwtSecret))
 	protected.GET("/me", userHandler.GetMe)
+	protected.PATCH("/me", userHandler.UpdateUser)
 
 	port := os.Getenv("PORT")
 	if port == "" {

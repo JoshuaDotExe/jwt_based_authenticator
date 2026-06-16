@@ -3,6 +3,7 @@ package user
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -15,8 +16,12 @@ var ErrInvalidUserInput = errors.New("invalid user input")
 const AuthenticatedUserIDKey = "userID"
 
 type Service interface {
+	Create(ctx context.Context, input CreateUserRequest) (User, error)
 	GetByID(ctx context.Context, userID string) (User, error)
-	Create(ctx context.Context, input CreateUserInput) (User, error)
+	UpdateName(ctx context.Context, userID string, input UpdateUserNameRequest) (User, error)
+	UpdateEmail(ctx context.Context, userID string, input UpdateUserEmailRequest) (User, error)
+	UpdateUsername(ctx context.Context, userID string, input UpdateUserUsernameRequest) (User, error)
+	UpdatePassword(ctx context.Context, userID string, input UpdateUserPasswordRequest) (User, error)
 }
 
 type Handler struct {
@@ -29,38 +34,6 @@ type User struct {
 	LastName  string
 	Email     string
 	Username  string
-}
-
-type CreateUserInput struct {
-	FirstName string
-	LastName  string
-	Email     string
-	Username  string
-	Password  string
-}
-
-type getMeResponse struct {
-	ID        string `json:"id"`
-	FirstName string `json:"first_name"`
-	LastName  string `json:"last_name"`
-	Email     string `json:"email"`
-	Username  string `json:"username"`
-}
-
-type postUserRequest struct {
-	FirstName string `json:"first_name" binding:"required"`
-	LastName  string `json:"last_name" binding:"required"`
-	Email     string `json:"email" binding:"required,email"`
-	Username  string `json:"username" binding:"required"`
-	Password  string `json:"password" binding:"required,min=8"`
-}
-
-type postUserResponse struct {
-	ID        string `json:"id"`
-	FirstName string `json:"first_name"`
-	LastName  string `json:"last_name"`
-	Email     string `json:"email"`
-	Username  string `json:"username"`
 }
 
 func NewHandler(service Service) *Handler {
@@ -105,7 +78,7 @@ func (h *Handler) PostUser(c *gin.Context) {
 		return
 	}
 
-	createdUser, err := h.service.Create(c.Request.Context(), CreateUserInput{
+	createdUser, err := h.service.Create(c.Request.Context(), CreateUserRequest{
 		FirstName: req.FirstName,
 		LastName:  req.LastName,
 		Email:     req.Email,
@@ -127,10 +100,44 @@ func (h *Handler) PostUser(c *gin.Context) {
 	}
 
 	c.JSON(201, postUserResponse{
-		ID:        createdUser.ID,
-		FirstName: createdUser.FirstName,
-		LastName:  createdUser.LastName,
-		Email:     createdUser.Email,
-		Username:  createdUser.Username,
+		ID: createdUser.ID,
 	})
+}
+
+func (h *Handler) UpdateUser(c *gin.Context) {
+	userID := strings.TrimSpace(c.GetString(AuthenticatedUserIDKey))
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, map[string]string{"error": "missing authenticated user"})
+		return
+	}
+
+	var req struct {
+		FirstName string `json:"first_name" binding:"required"`
+		LastName  string `json:"last_name" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+
+	updatedUser, err := h.service.UpdateName(c.Request.Context(), userID, UpdateUserNameRequest{
+		FirstName: req.FirstName,
+		LastName:  req.LastName,
+	})
+	if err != nil {
+		if errors.Is(err, ErrInvalidUserInput) {
+			c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user input"})
+			return
+		}
+		if errors.Is(err, ErrUserNotFound) {
+			c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
+			return
+		}
+
+		c.JSON(http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+		return
+	}
+
+	c.JSON(http.StatusOK, updateUserResponse{ID: updatedUser.ID})
+
 }

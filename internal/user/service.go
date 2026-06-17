@@ -4,45 +4,88 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
-	"database/sql"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	ddbt "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/google/uuid"
-	"github.com/lib/pq"
 	"golang.org/x/crypto/argon2"
 )
 
-type postgresService struct {
-	db *sql.DB
+type dynamoService struct {
+	ddb              *dynamodb.Client
+	usersTable       string
+	userUniquesTable string
 }
 
-func NewPostgresService(db *sql.DB) Service {
-	return &postgresService{db: db}
+type userRecord struct {
+	ID                string `dynamodbav:"id"`
+	FirstName         string `dynamodbav:"first_name"`
+	LastName          string `dynamodbav:"last_name"`
+	Email             string `dynamodbav:"email"`
+	Username          string `dynamodbav:"username"`
+	PasswordHash      string `dynamodbav:"password_hash"`
+	PasswordAlgo      string `dynamodbav:"password_algo"`
+	PasswordChangedAt string `dynamodbav:"password_changed_at"`
+	CreatedAt         string `dynamodbav:"created_at"`
+	UpdatedAt         string `dynamodbav:"updated_at"`
 }
 
-func (s *postgresService) GetByID(ctx context.Context, userID string) (User, error) {
-	var result User
+func NewDynamoService(ddb *dynamodb.Client, usersTable, userUniquesTable string) Service {
+	return &dynamoService{
+		ddb:              ddb,
+		usersTable:       strings.TrimSpace(usersTable),
+		userUniquesTable: strings.TrimSpace(userUniquesTable),
+	}
+}
 
-	err := s.db.QueryRowContext(
-		ctx,
-		"SELECT id::text, first_name, last_name, email, username FROM users WHERE id = $1",
-		userID,
-	).Scan(&result.ID, &result.FirstName, &result.LastName, &result.Email, &result.Username)
+func (s *dynamoService) GetByID(ctx context.Context, userID string) (User, error) {
+	record, err := s.getUserRecordByID(ctx, userID)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return User{}, ErrUserNotFound
-		}
 		return User{}, err
 	}
 
-	return result, nil
+	return User{
+		ID:        record.ID,
+		FirstName: record.FirstName,
+		LastName:  record.LastName,
+		Email:     record.Email,
+		Username:  record.Username,
+	}, nil
+
 }
 
-func (s *postgresService) Create(ctx context.Context, input CreateUserRequest) (User, error) {
+func (s *dynamoService) getUserRecordByID(ctx context.Context, userID string) (userRecord, error) {
+	resp, err := s.ddb.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: &s.usersTable,
+		Key: map[string]ddbt.AttributeValue{
+			"id": &ddbt.AttributeValueMemberS{Value: userID},
+		},
+		ConsistentRead: boolPtr(true),
+	})
+	if err != nil {
+		return userRecord{}, err
+	}
+
+	if len(resp.Item) == 0 {
+		return userRecord{}, ErrUserNotFound
+	}
+
+	var record userRecord
+	if err := attributevalue.UnmarshalMap(resp.Item, &record); err != nil {
+		return userRecord{}, err
+	}
+
+	return record, nil
+}
+
+func (s *dynamoService) Create(ctx context.Context, input CreateUserRequest) (User, error) {
 	newUser := User{
 		ID:        uuid.NewString(),
 		FirstName: strings.TrimSpace(input.FirstName),
@@ -61,147 +104,247 @@ func (s *postgresService) Create(ctx context.Context, input CreateUserRequest) (
 		return User{}, err
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	record := userRecord{
+		ID:                newUser.ID,
+		FirstName:         newUser.FirstName,
+		LastName:          newUser.LastName,
+		Email:             newUser.Email,
+		Username:          newUser.Username,
+		PasswordHash:      passwordHash,
+		PasswordAlgo:      "argon2id",
+		PasswordChangedAt: now,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}
+
+	userItem, err := attributevalue.MarshalMap(record)
 	if err != nil {
 		return User{}, err
 	}
-	defer tx.Rollback()
 
-	_, err = tx.ExecContext(
-		ctx,
-		"INSERT INTO users (id, first_name, last_name, email, username) VALUES ($1, $2, $3, $4, $5)",
-		newUser.ID,
-		newUser.FirstName,
-		newUser.LastName,
-		newUser.Email,
-		newUser.Username,
-	)
+	_, err = s.ddb.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []ddbt.TransactWriteItem{
+			{
+				Put: &ddbt.Put{
+					TableName:           &s.usersTable,
+					Item:                userItem,
+					ConditionExpression: stringPtr("attribute_not_exists(id)"),
+				},
+			},
+			{
+				Put: &ddbt.Put{
+					TableName:           &s.userUniquesTable,
+					Item:                marshalUniqueItem(userUniqueUsernameKey(newUser.Username), newUser.ID),
+					ConditionExpression: stringPtr("attribute_not_exists(#k)"),
+					ExpressionAttributeNames: map[string]string{
+						"#k": "key",
+					},
+				},
+			},
+			{
+				Put: &ddbt.Put{
+					TableName:           &s.userUniquesTable,
+					Item:                marshalUniqueItem(userUniqueEmailKey(newUser.Email), newUser.ID),
+					ConditionExpression: stringPtr("attribute_not_exists(#k)"),
+					ExpressionAttributeNames: map[string]string{
+						"#k": "key",
+					},
+				},
+			},
+		},
+	})
 	if err != nil {
-		if isUniqueViolation(err) {
+		if isTransactionCanceled(err) {
 			return User{}, ErrUserAlreadyExists
 		}
-		return User{}, err
-	}
-
-	_, err = tx.ExecContext(
-		ctx,
-		"INSERT INTO user_credentials (user_id, password_hash, password_algo) VALUES ($1, $2, $3)",
-		newUser.ID,
-		passwordHash,
-		"argon2id",
-	)
-	if err != nil {
-		if isUniqueViolation(err) {
-			return User{}, ErrUserAlreadyExists
-		}
-		return User{}, err
-	}
-
-	if err := tx.Commit(); err != nil {
 		return User{}, err
 	}
 
 	return newUser, nil
 }
 
-func (s *postgresService) UpdateName(ctx context.Context, userID string, input UpdateUserNameRequest) (User, error) {
+func (s *dynamoService) UpdateName(ctx context.Context, userID string, input UpdateUserNameRequest) (User, error) {
 	firstName := strings.TrimSpace(input.FirstName)
 	lastName := strings.TrimSpace(input.LastName)
 	if firstName == "" || lastName == "" {
 		return User{}, ErrInvalidUserInput
 	}
 
-	var updated User
-	err := s.db.QueryRowContext(
-		ctx,
-		"UPDATE users SET first_name = $2, last_name = $3, updated_at = NOW() WHERE id = $1 RETURNING id::text, first_name, last_name, email, username",
-		userID,
-		firstName,
-		lastName,
-	).Scan(&updated.ID, &updated.FirstName, &updated.LastName, &updated.Email, &updated.Username)
+	resp, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: &s.usersTable,
+		Key: map[string]ddbt.AttributeValue{
+			"id": &ddbt.AttributeValueMemberS{Value: userID},
+		},
+		ConditionExpression: stringPtr("attribute_exists(id)"),
+		UpdateExpression:    stringPtr("SET first_name = :first_name, last_name = :last_name, updated_at = :updated_at"),
+		ExpressionAttributeValues: map[string]ddbt.AttributeValue{
+			":first_name": &ddbt.AttributeValueMemberS{Value: firstName},
+			":last_name":  &ddbt.AttributeValueMemberS{Value: lastName},
+			":updated_at": &ddbt.AttributeValueMemberS{Value: time.Now().UTC().Format(time.RFC3339Nano)},
+		},
+		ReturnValues: ddbt.ReturnValueAllNew,
+	})
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+		if isConditionalCheckFailed(err) {
 			return User{}, ErrUserNotFound
 		}
 		return User{}, err
 	}
 
-	return updated, nil
+	var updated userRecord
+	if err := attributevalue.UnmarshalMap(resp.Attributes, &updated); err != nil {
+		return User{}, err
+	}
+
+	return User{
+		ID:        updated.ID,
+		FirstName: updated.FirstName,
+		LastName:  updated.LastName,
+		Email:     updated.Email,
+		Username:  updated.Username,
+	}, nil
 }
 
-func (s *postgresService) UpdateEmail(ctx context.Context, userID string, input UpdateUserEmailRequest) (User, error) {
+func (s *dynamoService) UpdateEmail(ctx context.Context, userID string, input UpdateUserEmailRequest) (User, error) {
 	email := strings.ToLower(strings.TrimSpace(input.Email))
 	if email == "" {
 		return User{}, ErrInvalidUserInput
 	}
 
-	var updated User
-	err := s.db.QueryRowContext(
-		ctx,
-		"UPDATE users SET email = $2, updated_at = NOW() WHERE id = $1 RETURNING id::text, first_name, last_name, email, username",
-		userID,
-		email,
-	).Scan(&updated.ID, &updated.FirstName, &updated.LastName, &updated.Email, &updated.Username)
+	record, err := s.getUserRecordByID(ctx, userID)
 	if err != nil {
-		if isUniqueViolation(err) {
+		return User{}, err
+	}
+	if record.Email == email {
+		return User{ID: record.ID, FirstName: record.FirstName, LastName: record.LastName, Email: record.Email, Username: record.Username}, nil
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err = s.ddb.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []ddbt.TransactWriteItem{
+			{
+				Update: &ddbt.Update{
+					TableName:           &s.usersTable,
+					Key:                 map[string]ddbt.AttributeValue{"id": &ddbt.AttributeValueMemberS{Value: userID}},
+					ConditionExpression: stringPtr("attribute_exists(id)"),
+					UpdateExpression:    stringPtr("SET email = :email, updated_at = :updated_at"),
+					ExpressionAttributeValues: map[string]ddbt.AttributeValue{
+						":email":      &ddbt.AttributeValueMemberS{Value: email},
+						":updated_at": &ddbt.AttributeValueMemberS{Value: now},
+					},
+				},
+			},
+			{
+				Put: &ddbt.Put{
+					TableName:           &s.userUniquesTable,
+					Item:                marshalUniqueItem(userUniqueEmailKey(email), userID),
+					ConditionExpression: stringPtr("attribute_not_exists(#k)"),
+					ExpressionAttributeNames: map[string]string{
+						"#k": "key",
+					},
+				},
+			},
+			{
+				Delete: &ddbt.Delete{
+					TableName: &s.userUniquesTable,
+					Key: map[string]ddbt.AttributeValue{
+						"key": &ddbt.AttributeValueMemberS{Value: userUniqueEmailKey(record.Email)},
+					},
+					ConditionExpression: stringPtr("user_id = :user_id"),
+					ExpressionAttributeValues: map[string]ddbt.AttributeValue{
+						":user_id": &ddbt.AttributeValueMemberS{Value: userID},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		if isTransactionCanceled(err) {
 			return User{}, ErrUserAlreadyExists
-		}
-		if errors.Is(err, sql.ErrNoRows) {
-			return User{}, ErrUserNotFound
 		}
 		return User{}, err
 	}
 
-	return updated, nil
+	return s.GetByID(ctx, userID)
 }
 
-func (s *postgresService) UpdateUsername(ctx context.Context, userID string, input UpdateUserUsernameRequest) (User, error) {
+func (s *dynamoService) UpdateUsername(ctx context.Context, userID string, input UpdateUserUsernameRequest) (User, error) {
 	username := strings.TrimSpace(input.Username)
 	if username == "" {
 		return User{}, ErrInvalidUserInput
 	}
 
-	var updated User
-	err := s.db.QueryRowContext(
-		ctx,
-		"UPDATE users SET username = $2, updated_at = NOW() WHERE id = $1 RETURNING id::text, first_name, last_name, email, username",
-		userID,
-		username,
-	).Scan(&updated.ID, &updated.FirstName, &updated.LastName, &updated.Email, &updated.Username)
+	record, err := s.getUserRecordByID(ctx, userID)
 	if err != nil {
-		if isUniqueViolation(err) {
+		return User{}, err
+	}
+	if record.Username == username {
+		return User{ID: record.ID, FirstName: record.FirstName, LastName: record.LastName, Email: record.Email, Username: record.Username}, nil
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err = s.ddb.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []ddbt.TransactWriteItem{
+			{
+				Update: &ddbt.Update{
+					TableName:           &s.usersTable,
+					Key:                 map[string]ddbt.AttributeValue{"id": &ddbt.AttributeValueMemberS{Value: userID}},
+					ConditionExpression: stringPtr("attribute_exists(id)"),
+					UpdateExpression:    stringPtr("SET username = :username, updated_at = :updated_at"),
+					ExpressionAttributeValues: map[string]ddbt.AttributeValue{
+						":username":   &ddbt.AttributeValueMemberS{Value: username},
+						":updated_at": &ddbt.AttributeValueMemberS{Value: now},
+					},
+				},
+			},
+			{
+				Put: &ddbt.Put{
+					TableName:           &s.userUniquesTable,
+					Item:                marshalUniqueItem(userUniqueUsernameKey(username), userID),
+					ConditionExpression: stringPtr("attribute_not_exists(#k)"),
+					ExpressionAttributeNames: map[string]string{
+						"#k": "key",
+					},
+				},
+			},
+			{
+				Delete: &ddbt.Delete{
+					TableName: &s.userUniquesTable,
+					Key: map[string]ddbt.AttributeValue{
+						"key": &ddbt.AttributeValueMemberS{Value: userUniqueUsernameKey(record.Username)},
+					},
+					ConditionExpression: stringPtr("user_id = :user_id"),
+					ExpressionAttributeValues: map[string]ddbt.AttributeValue{
+						":user_id": &ddbt.AttributeValueMemberS{Value: userID},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		if isTransactionCanceled(err) {
 			return User{}, ErrUserAlreadyExists
-		}
-		if errors.Is(err, sql.ErrNoRows) {
-			return User{}, ErrUserNotFound
 		}
 		return User{}, err
 	}
 
-	return updated, nil
+	return s.GetByID(ctx, userID)
 }
 
-func (s *postgresService) UpdatePassword(ctx context.Context, userID string, input UpdateUserPasswordRequest) (User, error) {
+func (s *dynamoService) UpdatePassword(ctx context.Context, userID string, input UpdateUserPasswordRequest) (User, error) {
 	currentPassword := input.CurrentPassword
 	newPassword := input.NewPassword
 	if currentPassword == "" || len(newPassword) < 8 {
 		return User{}, ErrInvalidUserInput
 	}
 
-	var encodedHash string
-	err := s.db.QueryRowContext(
-		ctx,
-		"SELECT password_hash FROM user_credentials WHERE user_id = $1",
-		userID,
-	).Scan(&encodedHash)
+	record, err := s.getUserRecordByID(ctx, userID)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return User{}, ErrUserNotFound
-		}
 		return User{}, err
 	}
 
-	isValid, err := verifyArgon2idPassword(currentPassword, encodedHash)
+	isValid, err := verifyArgon2idPassword(currentPassword, record.PasswordHash)
 	if err != nil {
 		return User{}, err
 	}
@@ -214,14 +357,25 @@ func (s *postgresService) UpdatePassword(ctx context.Context, userID string, inp
 		return User{}, err
 	}
 
-	_, err = s.db.ExecContext(
-		ctx,
-		"UPDATE user_credentials SET password_hash = $2, password_algo = $3, password_changed_at = NOW() WHERE user_id = $1",
-		userID,
-		newHash,
-		"argon2id",
-	)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err = s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: &s.usersTable,
+		Key: map[string]ddbt.AttributeValue{
+			"id": &ddbt.AttributeValueMemberS{Value: userID},
+		},
+		ConditionExpression: stringPtr("attribute_exists(id)"),
+		UpdateExpression:    stringPtr("SET password_hash = :password_hash, password_algo = :password_algo, password_changed_at = :password_changed_at, updated_at = :updated_at"),
+		ExpressionAttributeValues: map[string]ddbt.AttributeValue{
+			":password_hash":       &ddbt.AttributeValueMemberS{Value: newHash},
+			":password_algo":       &ddbt.AttributeValueMemberS{Value: "argon2id"},
+			":password_changed_at": &ddbt.AttributeValueMemberS{Value: now},
+			":updated_at":          &ddbt.AttributeValueMemberS{Value: now},
+		},
+	})
 	if err != nil {
+		if isConditionalCheckFailed(err) {
+			return User{}, ErrUserNotFound
+		}
 		return User{}, err
 	}
 
@@ -308,11 +462,43 @@ func verifyArgon2idPassword(password, encodedHash string) (bool, error) {
 	return true, nil
 }
 
-func isUniqueViolation(err error) bool {
-	var pqErr *pq.Error
-	if errors.As(err, &pqErr) && pqErr.Code == "23505" {
+func isConditionalCheckFailed(err error) bool {
+	var ccf *ddbt.ConditionalCheckFailedException
+	if errors.As(err, &ccf) {
 		return true
 	}
 
 	return false
+}
+
+func isTransactionCanceled(err error) bool {
+	var txErr *ddbt.TransactionCanceledException
+	if errors.As(err, &txErr) {
+		return true
+	}
+
+	return false
+}
+
+func marshalUniqueItem(key, userID string) map[string]ddbt.AttributeValue {
+	return map[string]ddbt.AttributeValue{
+		"key":     &ddbt.AttributeValueMemberS{Value: key},
+		"user_id": &ddbt.AttributeValueMemberS{Value: userID},
+	}
+}
+
+func userUniqueUsernameKey(username string) string {
+	return "username#" + username
+}
+
+func userUniqueEmailKey(email string) string {
+	return "email#" + email
+}
+
+func stringPtr(value string) *string {
+	return &value
+}
+
+func boolPtr(value bool) *bool {
+	return &value
 }

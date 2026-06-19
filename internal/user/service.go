@@ -19,9 +19,8 @@ import (
 )
 
 type dynamoService struct {
-	ddb              *dynamodb.Client
-	usersTable       string
-	userUniquesTable string
+	ddb        *dynamodb.Client
+	usersTable string
 }
 
 type userRecord struct {
@@ -37,11 +36,10 @@ type userRecord struct {
 	UpdatedAt         string `dynamodbav:"updated_at"`
 }
 
-func NewDynamoService(ddb *dynamodb.Client, usersTable, userUniquesTable string) Service {
+func NewDynamoService(ddb *dynamodb.Client, usersTable string) Service {
 	return &dynamoService{
-		ddb:              ddb,
-		usersTable:       strings.TrimSpace(usersTable),
-		userUniquesTable: strings.TrimSpace(userUniquesTable),
+		ddb:        ddb,
+		usersTable: strings.TrimSpace(usersTable),
 	}
 }
 
@@ -123,39 +121,13 @@ func (s *dynamoService) Create(ctx context.Context, input CreateUserRequest) (Us
 		return User{}, err
 	}
 
-	_, err = s.ddb.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
-		TransactItems: []ddbt.TransactWriteItem{
-			{
-				Put: &ddbt.Put{
-					TableName:           &s.usersTable,
-					Item:                userItem,
-					ConditionExpression: stringPtr("attribute_not_exists(id)"),
-				},
-			},
-			{
-				Put: &ddbt.Put{
-					TableName:           &s.userUniquesTable,
-					Item:                marshalUniqueItem(userUniqueUsernameKey(newUser.Username), newUser.ID),
-					ConditionExpression: stringPtr("attribute_not_exists(#k)"),
-					ExpressionAttributeNames: map[string]string{
-						"#k": "key",
-					},
-				},
-			},
-			{
-				Put: &ddbt.Put{
-					TableName:           &s.userUniquesTable,
-					Item:                marshalUniqueItem(userUniqueEmailKey(newUser.Email), newUser.ID),
-					ConditionExpression: stringPtr("attribute_not_exists(#k)"),
-					ExpressionAttributeNames: map[string]string{
-						"#k": "key",
-					},
-				},
-			},
-		},
+	_, err = s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName:           &s.usersTable,
+		Item:                userItem,
+		ConditionExpression: stringPtr("attribute_not_exists(id)"),
 	})
 	if err != nil {
-		if isTransactionCanceled(err) {
+		if isConditionalCheckFailed(err) {
 			return User{}, ErrUserAlreadyExists
 		}
 		return User{}, err
@@ -212,56 +184,22 @@ func (s *dynamoService) UpdateEmail(ctx context.Context, userID string, input Up
 		return User{}, ErrInvalidUserInput
 	}
 
-	record, err := s.getUserRecordByID(ctx, userID)
-	if err != nil {
-		return User{}, err
-	}
-	if record.Email == email {
-		return User{ID: record.ID, FirstName: record.FirstName, LastName: record.LastName, Email: record.Email, Username: record.Username}, nil
-	}
-
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err = s.ddb.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
-		TransactItems: []ddbt.TransactWriteItem{
-			{
-				Update: &ddbt.Update{
-					TableName:           &s.usersTable,
-					Key:                 map[string]ddbt.AttributeValue{"id": &ddbt.AttributeValueMemberS{Value: userID}},
-					ConditionExpression: stringPtr("attribute_exists(id)"),
-					UpdateExpression:    stringPtr("SET email = :email, updated_at = :updated_at"),
-					ExpressionAttributeValues: map[string]ddbt.AttributeValue{
-						":email":      &ddbt.AttributeValueMemberS{Value: email},
-						":updated_at": &ddbt.AttributeValueMemberS{Value: now},
-					},
-				},
-			},
-			{
-				Put: &ddbt.Put{
-					TableName:           &s.userUniquesTable,
-					Item:                marshalUniqueItem(userUniqueEmailKey(email), userID),
-					ConditionExpression: stringPtr("attribute_not_exists(#k)"),
-					ExpressionAttributeNames: map[string]string{
-						"#k": "key",
-					},
-				},
-			},
-			{
-				Delete: &ddbt.Delete{
-					TableName: &s.userUniquesTable,
-					Key: map[string]ddbt.AttributeValue{
-						"key": &ddbt.AttributeValueMemberS{Value: userUniqueEmailKey(record.Email)},
-					},
-					ConditionExpression: stringPtr("user_id = :user_id"),
-					ExpressionAttributeValues: map[string]ddbt.AttributeValue{
-						":user_id": &ddbt.AttributeValueMemberS{Value: userID},
-					},
-				},
-			},
+	_, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: &s.usersTable,
+		Key: map[string]ddbt.AttributeValue{
+			"id": &ddbt.AttributeValueMemberS{Value: userID},
+		},
+		ConditionExpression: stringPtr("attribute_exists(id)"),
+		UpdateExpression:    stringPtr("SET email = :email, updated_at = :updated_at"),
+		ExpressionAttributeValues: map[string]ddbt.AttributeValue{
+			":email":      &ddbt.AttributeValueMemberS{Value: email},
+			":updated_at": &ddbt.AttributeValueMemberS{Value: now},
 		},
 	})
 	if err != nil {
-		if isTransactionCanceled(err) {
-			return User{}, ErrUserAlreadyExists
+		if isConditionalCheckFailed(err) {
+			return User{}, ErrUserNotFound
 		}
 		return User{}, err
 	}
@@ -275,56 +213,22 @@ func (s *dynamoService) UpdateUsername(ctx context.Context, userID string, input
 		return User{}, ErrInvalidUserInput
 	}
 
-	record, err := s.getUserRecordByID(ctx, userID)
-	if err != nil {
-		return User{}, err
-	}
-	if record.Username == username {
-		return User{ID: record.ID, FirstName: record.FirstName, LastName: record.LastName, Email: record.Email, Username: record.Username}, nil
-	}
-
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err = s.ddb.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
-		TransactItems: []ddbt.TransactWriteItem{
-			{
-				Update: &ddbt.Update{
-					TableName:           &s.usersTable,
-					Key:                 map[string]ddbt.AttributeValue{"id": &ddbt.AttributeValueMemberS{Value: userID}},
-					ConditionExpression: stringPtr("attribute_exists(id)"),
-					UpdateExpression:    stringPtr("SET username = :username, updated_at = :updated_at"),
-					ExpressionAttributeValues: map[string]ddbt.AttributeValue{
-						":username":   &ddbt.AttributeValueMemberS{Value: username},
-						":updated_at": &ddbt.AttributeValueMemberS{Value: now},
-					},
-				},
-			},
-			{
-				Put: &ddbt.Put{
-					TableName:           &s.userUniquesTable,
-					Item:                marshalUniqueItem(userUniqueUsernameKey(username), userID),
-					ConditionExpression: stringPtr("attribute_not_exists(#k)"),
-					ExpressionAttributeNames: map[string]string{
-						"#k": "key",
-					},
-				},
-			},
-			{
-				Delete: &ddbt.Delete{
-					TableName: &s.userUniquesTable,
-					Key: map[string]ddbt.AttributeValue{
-						"key": &ddbt.AttributeValueMemberS{Value: userUniqueUsernameKey(record.Username)},
-					},
-					ConditionExpression: stringPtr("user_id = :user_id"),
-					ExpressionAttributeValues: map[string]ddbt.AttributeValue{
-						":user_id": &ddbt.AttributeValueMemberS{Value: userID},
-					},
-				},
-			},
+	_, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: &s.usersTable,
+		Key: map[string]ddbt.AttributeValue{
+			"id": &ddbt.AttributeValueMemberS{Value: userID},
+		},
+		ConditionExpression: stringPtr("attribute_exists(id)"),
+		UpdateExpression:    stringPtr("SET username = :username, updated_at = :updated_at"),
+		ExpressionAttributeValues: map[string]ddbt.AttributeValue{
+			":username":   &ddbt.AttributeValueMemberS{Value: username},
+			":updated_at": &ddbt.AttributeValueMemberS{Value: now},
 		},
 	})
 	if err != nil {
-		if isTransactionCanceled(err) {
-			return User{}, ErrUserAlreadyExists
+		if isConditionalCheckFailed(err) {
+			return User{}, ErrUserNotFound
 		}
 		return User{}, err
 	}
@@ -469,30 +373,6 @@ func isConditionalCheckFailed(err error) bool {
 	}
 
 	return false
-}
-
-func isTransactionCanceled(err error) bool {
-	var txErr *ddbt.TransactionCanceledException
-	if errors.As(err, &txErr) {
-		return true
-	}
-
-	return false
-}
-
-func marshalUniqueItem(key, userID string) map[string]ddbt.AttributeValue {
-	return map[string]ddbt.AttributeValue{
-		"key":     &ddbt.AttributeValueMemberS{Value: key},
-		"user_id": &ddbt.AttributeValueMemberS{Value: userID},
-	}
-}
-
-func userUniqueUsernameKey(username string) string {
-	return "username#" + username
-}
-
-func userUniqueEmailKey(email string) string {
-	return "email#" + email
 }
 
 func stringPtr(value string) *string {

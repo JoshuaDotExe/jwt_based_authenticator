@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"strings"
 	"time"
 
@@ -17,21 +16,17 @@ import (
 )
 
 type Service struct {
-	ddb              *dynamodb.Client
-	usersTable       string
-	userUniquesTable string
-	config           Config
+	ddb        *dynamodb.Client
+	usersTable string
+	config     Config
 }
 
-func NewService(ddb *dynamodb.Client, usersTable, userUniquesTable string, config Config) (*Service, error) {
+func NewService(ddb *dynamodb.Client, usersTable string, config Config) (*Service, error) {
 	if ddb == nil {
 		return nil, errors.New("dynamodb client is required")
 	}
 	if strings.TrimSpace(usersTable) == "" {
 		return nil, errors.New("users table is required")
-	}
-	if strings.TrimSpace(userUniquesTable) == "" {
-		return nil, errors.New("user uniques table is required")
 	}
 	if strings.TrimSpace(config.Secret) == "" {
 		return nil, errors.New("auth secret is required")
@@ -50,10 +45,9 @@ func NewService(ddb *dynamodb.Client, usersTable, userUniquesTable string, confi
 	}
 
 	return &Service{
-		ddb:              ddb,
-		usersTable:       strings.TrimSpace(usersTable),
-		userUniquesTable: strings.TrimSpace(userUniquesTable),
-		config:           config,
+		ddb:        ddb,
+		usersTable: strings.TrimSpace(usersTable),
+		config:     config,
 	}, nil
 }
 
@@ -63,38 +57,19 @@ func (s *Service) AuthenticateUser(ctx context.Context, username, password strin
 		return AuthenticatedUser{}, ErrMissingCredentials
 	}
 
-	uniqueResp, err := s.ddb.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName: &s.userUniquesTable,
-		Key: map[string]ddbt.AttributeValue{
-			"key": &ddbt.AttributeValueMemberS{Value: userUniqueUsernameKey(username)},
+	usersResp, err := s.ddb.Scan(ctx, &dynamodb.ScanInput{
+		TableName:        &s.usersTable,
+		FilterExpression: stringPtr("username = :username"),
+		ExpressionAttributeValues: map[string]ddbt.AttributeValue{
+			":username": &ddbt.AttributeValueMemberS{Value: username},
 		},
+		Limit:          int32Ptr(1),
 		ConsistentRead: boolPtr(true),
 	})
 	if err != nil {
 		return AuthenticatedUser{}, err
 	}
-	if len(uniqueResp.Item) == 0 {
-		return AuthenticatedUser{}, ErrInvalidCredentials
-	}
-
-	var uniqueRecord struct {
-		UserID string `dynamodbav:"user_id"`
-	}
-	if err := attributevalue.UnmarshalMap(uniqueResp.Item, &uniqueRecord); err != nil {
-		return AuthenticatedUser{}, fmt.Errorf("decode user unique record: %w", err)
-	}
-
-	userResp, err := s.ddb.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName: &s.usersTable,
-		Key: map[string]ddbt.AttributeValue{
-			"id": &ddbt.AttributeValueMemberS{Value: uniqueRecord.UserID},
-		},
-		ConsistentRead: boolPtr(true),
-	})
-	if err != nil {
-		return AuthenticatedUser{}, err
-	}
-	if len(userResp.Item) == 0 {
+	if len(usersResp.Items) == 0 {
 		return AuthenticatedUser{}, ErrInvalidCredentials
 	}
 
@@ -105,8 +80,8 @@ func (s *Service) AuthenticateUser(ctx context.Context, username, password strin
 		Email        string `dynamodbav:"email"`
 		PasswordHash string `dynamodbav:"password_hash"`
 	}
-	if err := attributevalue.UnmarshalMap(userResp.Item, &user); err != nil {
-		return AuthenticatedUser{}, fmt.Errorf("decode user record: %w", err)
+	if err := attributevalue.UnmarshalMap(usersResp.Items[0], &user); err != nil {
+		return AuthenticatedUser{}, err
 	}
 
 	isValidPassword, err := verifyArgon2idPassword(password, user.PasswordHash)
@@ -207,10 +182,14 @@ func createRefreshToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(randomBytes), nil
 }
 
-func userUniqueUsernameKey(username string) string {
-	return "username#" + username
+func boolPtr(value bool) *bool {
+	return &value
 }
 
-func boolPtr(value bool) *bool {
+func int32Ptr(value int32) *int32 {
+	return &value
+}
+
+func stringPtr(value string) *string {
 	return &value
 }

@@ -26,12 +26,6 @@ type healthResponse struct {
 	Timestamp string `json:"timestamp"`
 }
 
-type createTokenRequest struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-	Aud      string `json:"aud"`
-}
-
 func main() {
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery())
@@ -44,10 +38,6 @@ func main() {
 	usersTable := strings.TrimSpace(os.Getenv("USERS_TABLE"))
 	if usersTable == "" {
 		usersTable = "users"
-	}
-	userUniquesTable := strings.TrimSpace(os.Getenv("USER_UNIQUES_TABLE"))
-	if userUniquesTable == "" {
-		userUniquesTable = "user_uniques"
 	}
 	recipesTable := strings.TrimSpace(os.Getenv("RECIPES_TABLE"))
 	if recipesTable == "" {
@@ -71,21 +61,23 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	if err := ensureDynamoTables(ctx, ddb, usersTable, userUniquesTable, recipesTable); err != nil {
+	if err := ensureDynamoTables(ctx, ddb, usersTable, recipesTable); err != nil {
 		log.Fatalf("error: failed to ensure dynamodb tables: %v", err)
 	}
 
-	_, err = ddb.ListTables(ctx, &dynamodb.ListTablesInput{Limit: aws.Int32(1)})
+	listTablesResp, err := ddb.ListTables(ctx, &dynamodb.ListTablesInput{})
 	if err != nil {
 		log.Fatalf("error: failed to connect to dynamodb: %v", err)
 	}
+
+	log.Printf("dynamodb tables: %v", listTablesResp.TableNames)
 
 	jwtSecret := os.Getenv("JWT_SECRET")
 	if jwtSecret == "" {
 		log.Fatalf("error: JWT_SECRET environment variable not set")
 	}
 
-	authService, err := auth.NewService(ddb, usersTable, userUniquesTable, auth.Config{
+	authService, err := auth.NewService(ddb, usersTable, auth.Config{
 		Secret:          jwtSecret,
 		Issuer:          "auth.local",
 		DefaultAudience: "api.local",
@@ -96,7 +88,8 @@ func main() {
 		log.Fatalf("error: failed to initialize auth service: %v", err)
 	}
 
-	userHandler := user.NewHandler(user.NewDynamoService(ddb, usersTable, userUniquesTable))
+	authHandler := auth.NewHandler(authService)
+	userHandler := user.NewHandler(user.NewDynamoService(ddb, usersTable))
 	recipeHandler := recipe.NewHandler(recipe.NewDynamoService(ddb, recipesTable))
 
 	router.GET("/health", func(c *gin.Context) {
@@ -107,44 +100,7 @@ func main() {
 		})
 	})
 
-	router.POST("/token", func(c *gin.Context) {
-		var req createTokenRequest
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
-			return
-		}
-
-		authenticatedUser, err := authService.AuthenticateUser(c.Request.Context(), req.Username, req.Password)
-		if err != nil {
-			if errors.Is(err, auth.ErrInvalidCredentials) {
-				c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
-				return
-			}
-
-			if errors.Is(err, auth.ErrMissingCredentials) {
-				c.JSON(http.StatusBadRequest, map[string]string{"error": "username and password are required"})
-				return
-			}
-
-			log.Printf("authentication error: %v", err)
-			c.JSON(http.StatusInternalServerError, map[string]string{"error": "internal server error"})
-			return
-		}
-
-		resp, err := authService.CreateTokens(auth.TokenInput{
-			Sub:       authenticatedUser.ID,
-			Aud:       req.Aud,
-			FirstName: authenticatedUser.FirstName,
-			LastName:  authenticatedUser.LastName,
-			Email:     authenticatedUser.Email,
-		})
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create tokens"})
-			return
-		}
-
-		c.JSON(http.StatusCreated, resp)
-	})
+	router.POST("/token", authHandler.PostToken)
 
 	router.POST("/user/create", userHandler.PostUser)
 
@@ -159,6 +115,7 @@ func main() {
 	protected.GET("/internal/recipe/:id", recipeHandler.GetRecipeByID)
 	protected.PUT("/internal/recipe/:id", recipeHandler.UpdateRecipe)
 	protected.DELETE("/internal/recipe/:id", recipeHandler.DeleteRecipe)
+	protected.GET("/internal/recipe/owner/:id", recipeHandler.GetByOwnerID)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -177,12 +134,8 @@ func main() {
 	}
 }
 
-func ensureDynamoTables(ctx context.Context, ddb *dynamodb.Client, usersTable, userUniquesTable, recipesTable string) error {
+func ensureDynamoTables(ctx context.Context, ddb *dynamodb.Client, usersTable, recipesTable string) error {
 	if err := ensureTable(ctx, ddb, usersTable, "id"); err != nil {
-		return err
-	}
-
-	if err := ensureTable(ctx, ddb, userUniquesTable, "key"); err != nil {
 		return err
 	}
 

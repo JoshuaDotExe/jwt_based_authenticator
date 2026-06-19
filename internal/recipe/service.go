@@ -21,6 +21,7 @@ type recipeRecord struct {
 	ID           string       `dynamodbav:"id"`
 	OwnerID      string       `dynamodbav:"owner_id"`
 	Title        string       `dynamodbav:"title"`
+	Tags         []string     `dynamodbav:"tags"`
 	Ingredients  Ingredients  `dynamodbav:"ingredients"`
 	Instructions Instructions `dynamodbav:"instructions"`
 	CreatedAt    string       `dynamodbav:"created_at"`
@@ -32,6 +33,36 @@ func NewDynamoService(ddb *dynamodb.Client, recipeTable string) Service {
 		ddb:         ddb,
 		recipeTable: recipeTable,
 	}
+}
+
+func (s *dynamoService) GetByOwnerID(ctx context.Context, input GetRecipesByOwnerIDRequest) ([]Recipe, error) {
+	ownerID := strings.TrimSpace(input.OwnerID)
+	if ownerID == "" {
+		return nil, ErrInvalidRecipeInput
+	}
+
+	resp, err := s.ddb.Scan(ctx, &dynamodb.ScanInput{
+		TableName:        &s.recipeTable,
+		FilterExpression: awsString("owner_id = :owner_id"),
+		ExpressionAttributeValues: map[string]ddbt.AttributeValue{
+			":owner_id": &ddbt.AttributeValueMemberS{Value: ownerID},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var recipeRecords []recipeRecord
+	err = attributevalue.UnmarshalListOfMaps(resp.Items, &recipeRecords)
+	if err != nil {
+		return nil, err
+	}
+
+	var recipes []Recipe
+	for _, record := range recipeRecords {
+		recipes = append(recipes, recordToRecipe(record))
+	}
+	return recipes, nil
 }
 
 func (s *dynamoService) Create(ctx context.Context, ownerID string, input CreateRecipeRequest) (Recipe, error) {
@@ -46,6 +77,7 @@ func (s *dynamoService) Create(ctx context.Context, ownerID string, input Create
 		ID:           uuid.NewString(),
 		OwnerID:      ownerID,
 		Title:        title,
+		Tags:         normalizeTags(input.Tags),
 		Ingredients:  input.Ingredients,
 		Instructions: input.Instructions,
 		CreatedAt:    now,
@@ -65,15 +97,7 @@ func (s *dynamoService) Create(ctx context.Context, ownerID string, input Create
 		return Recipe{}, err
 	}
 
-	return Recipe{
-		ID:           newRecipe.ID,
-		OwnerID:      newRecipe.OwnerID,
-		Title:        newRecipe.Title,
-		Ingredients:  newRecipe.Ingredients,
-		Instructions: newRecipe.Instructions,
-		CreatedAt:    newRecipe.CreatedAt,
-		UpdatedAt:    newRecipe.UpdatedAt,
-	}, nil
+	return recordToRecipe(newRecipe), nil
 }
 
 func (s *dynamoService) GetByID(ctx context.Context, recipeID string) (Recipe, error) {
@@ -97,15 +121,7 @@ func (s *dynamoService) GetByID(ctx context.Context, recipeID string) (Recipe, e
 		return Recipe{}, err
 	}
 
-	return Recipe{
-		ID:           recipeRecord.ID,
-		OwnerID:      recipeRecord.OwnerID,
-		Title:        recipeRecord.Title,
-		Ingredients:  recipeRecord.Ingredients,
-		Instructions: recipeRecord.Instructions,
-		CreatedAt:    recipeRecord.CreatedAt,
-		UpdatedAt:    recipeRecord.UpdatedAt,
-	}, nil
+	return recordToRecipe(recipeRecord), nil
 }
 
 func (s *dynamoService) Update(ctx context.Context, recipeID string, input UpdateRecipeRequest) (Recipe, error) {
@@ -126,15 +142,21 @@ func (s *dynamoService) Update(ctx context.Context, recipeID string, input Updat
 		return Recipe{}, err
 	}
 
+	tagsAV, err := attributevalue.Marshal(normalizeTags(input.Tags))
+	if err != nil {
+		return Recipe{}, err
+	}
+
 	resp, err := s.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: &s.recipeTable,
 		Key: map[string]ddbt.AttributeValue{
 			"id": &ddbt.AttributeValueMemberS{Value: recipeID},
 		},
 		ConditionExpression: awsString("attribute_exists(id)"),
-		UpdateExpression:    awsString("SET title = :title, ingredients = :ingredients, instructions = :instructions, updated_at = :updated_at"),
+		UpdateExpression:    awsString("SET title = :title, tags = :tags, ingredients = :ingredients, instructions = :instructions, updated_at = :updated_at"),
 		ExpressionAttributeValues: map[string]ddbt.AttributeValue{
 			":title":        &ddbt.AttributeValueMemberS{Value: title},
+			":tags":         tagsAV,
 			":ingredients":  ingredientsAV,
 			":instructions": instructionsAV,
 			":updated_at":   &ddbt.AttributeValueMemberS{Value: now},
@@ -154,15 +176,7 @@ func (s *dynamoService) Update(ctx context.Context, recipeID string, input Updat
 		return Recipe{}, err
 	}
 
-	return Recipe{
-		ID:           updated.ID,
-		OwnerID:      updated.OwnerID,
-		Title:        updated.Title,
-		Ingredients:  updated.Ingredients,
-		Instructions: updated.Instructions,
-		CreatedAt:    updated.CreatedAt,
-		UpdatedAt:    updated.UpdatedAt,
-	}, nil
+	return recordToRecipe(updated), nil
 }
 
 func (s *dynamoService) Delete(ctx context.Context, recipeID string) error {
@@ -191,4 +205,39 @@ func (s *dynamoService) Delete(ctx context.Context, recipeID string) error {
 
 func awsString(value string) *string {
 	return &value
+}
+
+func recordToRecipe(record recipeRecord) Recipe {
+	return Recipe{
+		ID:           record.ID,
+		OwnerID:      record.OwnerID,
+		Title:        record.Title,
+		Tags:         append([]string(nil), record.Tags...),
+		Ingredients:  record.Ingredients,
+		Instructions: record.Instructions,
+		CreatedAt:    record.CreatedAt,
+		UpdatedAt:    record.UpdatedAt,
+	}
+}
+
+func normalizeTags(tags []string) []string {
+	if len(tags) == 0 {
+		return []string{}
+	}
+
+	normalized := make([]string, 0, len(tags))
+	seen := make(map[string]struct{}, len(tags))
+	for _, tag := range tags {
+		clean := strings.TrimSpace(tag)
+		if clean == "" {
+			continue
+		}
+		if _, exists := seen[clean]; exists {
+			continue
+		}
+		seen[clean] = struct{}{}
+		normalized = append(normalized, clean)
+	}
+
+	return normalized
 }

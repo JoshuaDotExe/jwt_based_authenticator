@@ -301,5 +301,5 @@ func updateMax(maxVal *atomic.Int64, candidate int64) {
 }
 
 func errorsNew(msg string) error {
-	return fmt.Errorf(msg)
+	return fmt.Errorf("%s", msg)
 }

@@ -2,6 +2,28 @@
 
 ## ID Token
 
+## Local Development
+
+This API now uses DynamoDB tables for user/auth persistence.
+
+### Environment Variables
+
+- `JWT_SECRET`: HMAC signing secret for access/id tokens.
+- `AWS_REGION`: AWS region for DynamoDB calls (default: `us-east-1`).
+- `DYNAMODB_ENDPOINT`: Optional custom DynamoDB endpoint. Use `http://dynamodb-local:8000` in Docker.
+- `USERS_TABLE`: DynamoDB table for user records (default: `users`).
+
+### Run With Docker Compose
+
+```bash
+docker compose up --build
+```
+
+Compose starts three services:
+
+- `api`: Gin API service.
+- `dynamodb-local`: Local DynamoDB emulator.
+
 ## Access Token Structure Reference
 
 This document describes the access token claim structure used by this project.
